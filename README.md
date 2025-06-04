@@ -1,4 +1,4 @@
-# 📄 Invoice OCR App for ERPNext
+# 📄 Invoice OCR App for ERPNext v15
 
 Automatically extract invoice data from scanned **PDF** or **image** files and generate Sales or Purchase Invoices in ERPNext using Tesseract OCR.
 
