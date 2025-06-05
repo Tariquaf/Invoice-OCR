@@ -3,3 +3,5 @@ pdf2image
 Pillow
 PyPDF2
 poppler-utils
+fuzzywuzzy
+python-Levenshtein

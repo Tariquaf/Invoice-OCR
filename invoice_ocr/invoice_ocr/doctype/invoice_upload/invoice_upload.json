@@ -1,17 +1,23 @@
 {
  "actions": [],
  "allow_rename": 1,
+ "autoname": "format:IU-{YY}-{MM}-{###}",
  "creation": "2025-05-24 00:30:47.121979",
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
   "party_type",
   "party",
+  "create_invoice",
+  "date",
+  "column_break_wauc",
   "file",
   "ocr_status",
+  "amended_from",
+  "extracted_data_section",
   "extracted_data",
-  "create_invoice",
-  "amended_from"
+  "invoice_item_section",
+  "invoice_upload_item"
  ],
  "fields": [
   {
@@ -59,15 +65,43 @@
    "fieldname": "file",
    "fieldtype": "Attach",
    "label": "Upload File"
+  },
+  {
+   "fieldname": "column_break_wauc",
+   "fieldtype": "Column Break"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "extracted_data_section",
+   "fieldtype": "Section Break",
+   "label": "Extracted Data"
+  },
+  {
+   "fieldname": "invoice_item_section",
+   "fieldtype": "Section Break",
+   "label": "Invoice Item"
+  },
+  {
+   "fieldname": "invoice_upload_item",
+   "fieldtype": "Table",
+   "label": "Invoice Upload Item",
+   "options": "Invoice Upload Item"
+  },
+  {
+   "default": "Today",
+   "fieldname": "date",
+   "fieldtype": "Date",
+   "label": "Date"
   }
  ],
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2025-05-24 23:32:12.597184",
+ "modified": "2025-06-04 12:36:03.895065",
  "modified_by": "Administrator",
  "module": "Invoice Ocr",
  "name": "Invoice Upload",
+ "naming_rule": "Expression",
  "owner": "Administrator",
  "permissions": [
   {
@@ -83,7 +117,9 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "modified",
  "sort_order": "DESC",
- "states": []
+ "states": [],
+ "track_changes": 1
 }
