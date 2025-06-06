@@ -53,7 +53,7 @@ source ~/frappe-bench/env/bin/activate
 pip install -r apps/invoice_ocr/requirements.txt
 
 # Or manually install requirements
-pip install pytesseract pdf2image Pillow PyPDF2
+pip install pytesseract pdf2image Pillow PyPDF2 easyocr opencv-python
 
 # Deactivate virtual enviroment
 deactivate
