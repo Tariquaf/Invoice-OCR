@@ -31,12 +31,14 @@ class InvoiceUpload(Document):
         text = ""
 
         if file_path.endswith(".pdf"):
-            images = convert_from_path(file_path)
-            for img in images:
-                text += pytesseract.image_to_string(img)
-        else:
-            img = Image.open(file_path)
-            text = pytesseract.image_to_string(img)
+    images = convert_from_path(file_path, dpi=300)
+    for img in images:
+        processed = preprocess_image(img)
+        text += pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
+else:
+    img = Image.open(file_path)
+    processed = preprocess_image(img)
+    text = pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
 
         items = self.extract_items(text)
         extracted_data = {
