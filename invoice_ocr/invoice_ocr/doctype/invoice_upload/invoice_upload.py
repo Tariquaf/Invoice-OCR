@@ -3,7 +3,6 @@ import pytesseract
 import numpy as np
 import frappe
 import json
-import pytesseract
 import re
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
@@ -11,6 +10,7 @@ from frappe.utils.file_manager import get_file_path
 from frappe.model.document import Document
 from PIL import Image
 from frappe.utils import add_days, get_url_to_form, nowdate
+
 
 class InvoiceUpload(Document):
     def on_submit(self):
@@ -30,15 +30,31 @@ class InvoiceUpload(Document):
         file_path = get_file_path(self.file)
         text = ""
 
+        def preprocess_image(pil_img):
+            img = np.array(pil_img.convert("RGB"))
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            scaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(scaled)
+
+            thresh = cv2.adaptiveThreshold(
+                enhanced, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 15, 10
+            )
+            return thresh
+
+        # OCR logic with improved accuracy
         if file_path.endswith(".pdf"):
-    images = convert_from_path(file_path, dpi=300)
-    for img in images:
-        processed = preprocess_image(img)
-        text += pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
-else:
-    img = Image.open(file_path)
-    processed = preprocess_image(img)
-    text = pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
+            images = convert_from_path(file_path, dpi=300)
+            for img in images:
+                processed = preprocess_image(img)
+                text += pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
+        else:
+            img = Image.open(file_path)
+            processed = preprocess_image(img)
+            text = pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
 
         items = self.extract_items(text)
         extracted_data = {
@@ -201,6 +217,7 @@ else:
                     if next_line:
                         return next_line
         return None
+
 
 @frappe.whitelist()
 def extract_invoice(docname):
