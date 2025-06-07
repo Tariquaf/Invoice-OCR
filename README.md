@@ -41,7 +41,9 @@ Install required system packages:
 
 ```bash
 sudo apt update
-sudo apt install -y poppler-utils tesseract-ocr tesseract-ocr-urd tesseract-ocr-eng
+sudo apt install tesseract-ocr libtesseract-dev tesseract-ocr-eng tesseract-ocr-urd
+sudo apt install poppler-utils  # For PDF processing
+sudo apt install libgl1-mesa-glx  # For OpenCV
 
 # Get the app from GitHub
 
@@ -54,6 +56,9 @@ pip install -r apps/invoice_ocr/requirements.txt
 
 # Or manually install requirements
 pip install opencv-python-headless pytesseract numpy PyPDF2 pdf2image Pillow requests
+
+# Verify dependencies
+python3 ~/frappe-bench/apps/invoice_ocr/verify_dep.py
 
 # Deactivate virtual enviroment
 deactivate
