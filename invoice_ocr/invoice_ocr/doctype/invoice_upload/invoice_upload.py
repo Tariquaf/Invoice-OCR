@@ -5,6 +5,7 @@ import frappe
 import json
 import re
 import traceback
+import difflib
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 from frappe.utils.file_manager import get_file_path
@@ -88,9 +89,26 @@ class InvoiceUpload(Document):
                 "party": None
             }
 
+            # Get all items for matching
+            all_items = self.get_items_for_matching()
+            
             self.set("invoice_upload_item", [])
             for row in items:
-                matched_item = frappe.db.get_value("Item", {"item_name": row["description"]})
+                # First try to match text in square brackets (item codes)
+                bracket_match = None
+                bracket_text = self.extract_bracket_text(row["description"])
+                
+                if bracket_text:
+                    bracket_match = self.fuzzy_match_item(bracket_text, all_items)
+                
+                # If bracket match found with high confidence, use it
+                if bracket_match and bracket_match["score"] > 85:
+                    matched_item = bracket_match["name"]
+                else:
+                    # Otherwise, match the full description
+                    full_match = self.fuzzy_match_item(row["description"], all_items)
+                    matched_item = full_match["name"] if full_match and full_match["score"] > 75 else None
+                
                 self.append("invoice_upload_item", {
                     "ocr_description": row["description"],
                     "qty": row["qty"],
@@ -98,9 +116,14 @@ class InvoiceUpload(Document):
                     "item": matched_item
                 })
 
-            party_code = self.extract_party(text)
-            if party_code:
-                extracted_data["party"] = party_code.strip()
+            # Extract party with fuzzy matching
+            party_name = self.extract_party(text)
+            if party_name:
+                party_match = self.fuzzy_match_party(party_name)
+                if party_match:
+                    extracted_data["party"] = party_match["name"]
+                else:
+                    extracted_data["party"] = party_name
 
             self.extracted_data = json.dumps(extracted_data, indent=2)
             self.ocr_status = "Extracted"
@@ -110,7 +133,7 @@ class InvoiceUpload(Document):
             return {
                 "status": "success",
                 "items": items,
-                "party": party_code
+                "party": extracted_data["party"]
             }
         except Exception as e:
             error_message = f"Extraction failed: {str(e)}\n{traceback.format_exc()}"
@@ -123,7 +146,19 @@ class InvoiceUpload(Document):
 
         if not party or not party.strip():
             frappe.throw("Party is missing. Cannot create invoice.")
+        
+        # Check if party is already an ID
+        if frappe.db.exists(self.party_type, party):
+            self.party = party
+            return
+            
+        # Try fuzzy matching again in case of new parties
+        party_match = self.fuzzy_match_party(party)
+        if party_match:
+            self.party = party_match["name"]
+            return
 
+        # Create new party if no match found
         if self.party_type == "Customer" and not frappe.db.exists("Customer", party):
             doc = frappe.get_doc({
                 "doctype": "Customer",
@@ -133,7 +168,7 @@ class InvoiceUpload(Document):
             })
             doc.insert(ignore_permissions=True)
             frappe.db.commit()
-            extracted["party"] = doc.name
+            self.party = doc.name
 
         elif self.party_type == "Supplier" and not frappe.db.exists("Supplier", party):
             doc = frappe.get_doc({
@@ -144,10 +179,8 @@ class InvoiceUpload(Document):
             })
             doc.insert(ignore_permissions=True)
             frappe.db.commit()
-            extracted["party"] = doc.name
+            self.party = doc.name
 
-        self.db_set("party", extracted["party"])
-        self.extracted_data = json.dumps(extracted, indent=2)
         self.save()
 
     def create_invoice_from_child(self):
@@ -172,15 +205,15 @@ class InvoiceUpload(Document):
 
         expense_account = self.get_expense_account()
 
-        for row in items:
-            item_code = frappe.db.get_value("Item", {"item_name": row["description"]})
+        for row in self.invoice_upload_item:
+            item_code = row.item
             if not item_code:
-                item_code = self.ensure_item_exists(row["description"])
+                item_code = self.ensure_item_exists(row.ocr_description)
 
             inv.append("items", {
                 "item_code": item_code,
-                "qty": row["qty"],
-                "rate": row["rate"],
+                "qty": row.qty,
+                "rate": row.rate,
                 "uom": "Nos",
                 "expense_account": expense_account
             })
@@ -294,33 +327,128 @@ class InvoiceUpload(Document):
         return items
 
     def extract_party(self, text):
-        # Try to extract from Source field
-        source_match = re.search(r'Source:\s*([^\n|]+)', text)
+        # Clean the text for better matching
+        clean_text = re.sub(r'[^\w\s\-:]', ' ', text)  # Remove special chars
+        clean_text = re.sub(r'\s+', ' ', clean_text)  # Normalize whitespace
+        
+        # 1. Try to extract from Source field (top priority)
+        source_match = re.search(r'Source\s*:\s*(\w[\w\s\-]+)', clean_text, re.IGNORECASE)
         if source_match:
             return source_match.group(1).strip()
         
-        # Try to extract from Payment Communication
-        payment_match = re.search(r'Payment\s+Communication:\s*([^\n]+)', text)
+        # 2. Try to extract from Payment Communication
+        payment_match = re.search(r'Payment\s+Communication\s*:\s*(\w[\w\s\-]+)', clean_text, re.IGNORECASE)
         if payment_match:
             return payment_match.group(1).strip()
-            
-        # Try to extract from Order number
-        order_match = re.search(r'Order\s*[#:]\s*([^\s]+)', text, re.IGNORECASE)
+        
+        # 3. Try to extract from Order number
+        order_match = re.search(r'Order\s*[#:]\s*(\w[\w\s\-]+)', clean_text, re.IGNORECASE)
         if order_match:
             return order_match.group(1).strip()
+        
+        # 4. Look for customer/supplier blocks
+        party_labels = ["Customer", "Supplier", "Vendor", "Client", "Bill To", "Sold To"]
+        for label in party_labels:
+            # Pattern 1: "Label: Value"
+            pattern1 = re.compile(fr'{label}\s*:\s*(\w[\w\s\-]+)', re.IGNORECASE)
+            match1 = pattern1.search(clean_text)
+            if match1:
+                return match1.group(1).strip()
             
-        # Fallback to original method
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if any(key.lower() in line.lower() for key in ["Customer Code", "Supplier Code", "Customer:", "Supplier:"]):
-                parts = line.split(":")
-                if len(parts) > 1 and parts[1].strip():
-                    return parts[1].strip()
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    if next_line:
-                        return next_line
+            # Pattern 2: "Label" on one line, value on next line
+            pattern2 = re.compile(fr'{label}\s*[\n:]+', re.IGNORECASE)
+            match2 = pattern2.search(clean_text)
+            if match2:
+                # Get the next non-empty line
+                rest_text = clean_text[match2.end():]
+                next_line = rest_text.split('\n')[0].strip()
+                if next_line:
+                    return next_line.split()[0]  # Take first word of next line
+        
         return None
+
+    def get_items_for_matching(self):
+        """Get all items with their names and codes for matching"""
+        items = frappe.get_all("Item", 
+                              fields=["name", "item_name", "item_code"],
+                              filters={"disabled": 0})
+        
+        # Create a list of all possible names and codes
+        item_data = []
+        for item in items:
+            item_data.append({
+                "name": item.name,
+                "match_text": item.item_name.lower(),
+                "type": "name"
+            })
+            if item.item_code and item.item_code != item.item_name:
+                item_data.append({
+                    "name": item.name,
+                    "match_text": item.item_code.lower(),
+                    "type": "code"
+                })
+        return item_data
+    
+    def extract_bracket_text(self, description):
+        """Extract text within square brackets"""
+        matches = re.findall(r'\[(.*?)\]', description)
+        return matches[0] if matches else None
+    
+    def fuzzy_match_item(self, text, all_items):
+        """Find the best item match using fuzzy matching"""
+        if not text:
+            return None
+            
+        clean_text = text.lower().strip()
+        best_match = None
+        best_score = 0
+        
+        for item in all_items:
+            score = difflib.SequenceMatcher(None, clean_text, item["match_text"]).ratio() * 100
+            if score > best_score:
+                best_score = score
+                best_match = {
+                    "name": item["name"],
+                    "score": score,
+                    "match_type": item["type"],
+                    "match_text": item["match_text"]
+                }
+        
+        # Return match only if it meets minimum confidence
+        return best_match if best_score > 70 else None
+
+    def fuzzy_match_party(self, party_name):
+        """Fuzzy match party against existing parties"""
+        if not party_name:
+            return None
+            
+        clean_name = party_name.lower().strip()
+        party_type = self.party_type
+        
+        # Get all parties of the specified type
+        if party_type == "Customer":
+            parties = frappe.get_all("Customer", fields=["name", "customer_name"])
+            names = [p["customer_name"] for p in parties]
+        else:
+            parties = frappe.get_all("Supplier", fields=["name", "supplier_name"])
+            names = [p["supplier_name"] for p in parties]
+            
+        # Find best match
+        best_match = None
+        best_score = 0
+        
+        for i, name in enumerate(names):
+            score = difflib.SequenceMatcher(None, clean_name, name.lower()).ratio() * 100
+            if score > best_score:
+                best_score = score
+                best_match = {
+                    "name": parties[i]["name"],
+                    "score": score,
+                    "match_name": name
+                }
+        
+        # Return match only if above confidence threshold
+        return best_match if best_score > 80 else None
 
 
 @frappe.whitelist()
