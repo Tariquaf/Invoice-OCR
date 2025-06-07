@@ -41,7 +41,7 @@ Install required system packages:
 
 ```bash
 sudo apt update
-sudo apt install -y poppler-utils tesseract-ocr tesseract-ocr-urd
+sudo apt install -y poppler-utils tesseract-ocr tesseract-ocr-urd tesseract-ocr-eng
 
 # Get the app from GitHub
 
