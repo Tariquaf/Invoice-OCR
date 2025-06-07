@@ -33,9 +33,11 @@ class InvoiceUpload(Document):
         def preprocess_image(pil_img):
             img = np.array(pil_img.convert("RGB"))
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
             scaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(scaled)
+
             thresh = cv2.adaptiveThreshold(
                 enhanced, 255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -43,11 +45,21 @@ class InvoiceUpload(Document):
             )
             return thresh
 
+      # OCR logic with improved accuracy
         if file_path.endswith(".pdf"):
             images = convert_from_path(file_path, dpi=300)
             for img in images:
                 processed = preprocess_image(img)
                 text += pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
+#		with open("/tmp/ocr_debug_output.txt", "a", encoding="utf-8") as f:
+#			f.write(text + "\n" + "="*80 + "\n")
+#	except Exception as e:
+ #   		frappe.log_error(frappe.get_traceback(), "Failed to write OCR debug log")
+		try:
+  with open("/tmp/ocr_debug_output.txt", "a", encoding="utf-8") as f:
+            f.write(text + "\n" + "="*80 + "\n")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Failed to write OCR debug log")
         else:
             img = Image.open(file_path)
             processed = preprocess_image(img)
@@ -107,7 +119,7 @@ class InvoiceUpload(Document):
             frappe.db.commit()
             extracted["party"] = doc.name
 
-        self.db_set("party", extracted["party"])
+        self.db_set("party", extracted["party"])  # Safe update after submit
         self.extracted_data = json.dumps(extracted, indent=2)
         self.save()
 
@@ -220,36 +232,3 @@ class InvoiceUpload(Document):
 def extract_invoice(docname):
     doc = frappe.get_doc("Invoice Upload", docname)
     doc.extract_invoice()
-
-
-# ✅ Debug method to test OCR safely
-@frappe.whitelist()
-def debug_ocr_preview(docname):
-    doc = frappe.get_doc("Invoice Upload", docname)
-    file_path = get_file_path(doc.file)
-
-    def preprocess_image(pil_img):
-        img = np.array(pil_img.convert("RGB"))
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        scaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(scaled)
-        thresh = cv2.adaptiveThreshold(
-            enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 15, 10
-        )
-        return thresh
-
-    text = ""
-    if file_path.endswith(".pdf"):
-        images = convert_from_path(file_path, dpi=300)
-        for img in images:
-            processed = preprocess_image(img)
-            text += pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
-    else:
-        img = Image.open(file_path)
-        processed = preprocess_image(img)
-        text = pytesseract.image_to_string(processed, config="--psm 4 -l eng+urd")
-
-    return text[:2000]  # Limit output to first 2000 characters
