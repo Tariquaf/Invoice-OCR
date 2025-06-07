@@ -4,13 +4,18 @@ import numpy as np
 import frappe
 import json
 import re
+import base64
+import io
+import traceback
+import requests
+import uuid
 from PyPDF2 import PdfReader
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, convert_from_bytes
 from frappe.utils.file_manager import get_file_path
 from frappe.model.document import Document
 from PIL import Image
 from frappe.utils import add_days, get_url_to_form, nowdate
-
+from datetime import datetime
 
 class InvoiceUpload(Document):
     def on_submit(self):
@@ -28,98 +33,92 @@ class InvoiceUpload(Document):
             frappe.throw("No file attached.")
 
         file_path = get_file_path(self.file)
-        text = ""
+        file_content = frappe.get_doc("File", {"file_url": self.file}).get_content()
 
-        def preprocess_image(pil_img):
-            img = np.array(pil_img.convert("RGB"))
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            scaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(scaled)
-            thresh = cv2.adaptiveThreshold(
-                enhanced, 255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY, 15, 10
-            )
-            return thresh
+        # Extract text with OCR
+        text = self._parse_attachment(file_content)
+        if not text:
+            frappe.throw("Failed to extract text from the document.")
 
-        if file_path.endswith(".pdf"):
-            images = convert_from_path(file_path, dpi=300)
-            for img in images:
-                processed = preprocess_image(img)
-                text += pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
-        else:
-            img = Image.open(file_path)
-            processed = preprocess_image(img)
-            text = pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
+        # Extract structured data with AI
+        extracted_data = self.extract_values_with_ai(text)
+        if not extracted_data:
+            frappe.throw("Failed to extract structured data from document.")
 
-        items = self.extract_items(text)
-        extracted_data = {
-            "items": items,
-            "party": None
-        }
+        # Process extracted data
+        self.process_extracted_data(extracted_data)
 
+    def process_extracted_data(self, extracted_data):
+        # Set party
+        party_code = extracted_data.get("party", {}).get("name")
+        if party_code:
+            self.ensure_party_exists(party_code)
+        
+        # Set items
         self.set("invoice_upload_item", [])
-        for row in items:
-            matched_item = frappe.db.get_value("Item", {"item_name": row["description"]})
+        for row in extracted_data.get("invoice_lines", []):
+            description = row.get("product", "")
+            qty = row.get("quantity", 0)
+            rate = row.get("price_unit", 0)
+            
+            matched_item = frappe.db.get_value("Item", {"item_name": description})
+            
             self.append("invoice_upload_item", {
-                "ocr_description": row["description"],
-                "qty": row["qty"],
-                "rate": row["rate"],
+                "ocr_description": description,
+                "qty": qty,
+                "rate": rate,
                 "item": matched_item
             })
 
-        party_code = self.extract_party(text)
-        if party_code:
-            extracted_data["party"] = party_code.strip()
+        # Set dates
+        if extracted_data.get("invoice_date"):
+            try:
+                self.posting_date = datetime.strptime(extracted_data["invoice_date"], "%Y-%m-%d").date()
+            except:
+                pass
 
         self.extracted_data = json.dumps(extracted_data, indent=2)
         self.ocr_status = "Extracted"
         self.save()
         frappe.msgprint("OCR Extraction completed. Please review data before submitting.")
 
-    def ensure_party_exists(self):
-        extracted = json.loads(self.extracted_data or '{}')
-        party = extracted.get("party")
+    def ensure_party_exists(self, party_name):
+        if not party_name or not party_name.strip():
+            frappe.throw("Party name is missing. Cannot create invoice.")
 
-        if not party or not party.strip():
-            frappe.throw("Party is missing. Cannot create invoice.")
-
-        if self.party_type == "Customer" and not frappe.db.exists("Customer", party):
+        if self.party_type == "Customer" and not frappe.db.exists("Customer", party_name):
             doc = frappe.get_doc({
                 "doctype": "Customer",
-                "customer_name": party.strip(),
+                "customer_name": party_name.strip(),
                 "customer_group": "All Customer Groups",
                 "territory": "All Territories"
             })
             doc.insert(ignore_permissions=True)
             frappe.db.commit()
-            extracted["party"] = doc.name
+            self.party = doc.name
 
-        elif self.party_type == "Supplier" and not frappe.db.exists("Supplier", party):
+        elif self.party_type == "Supplier" and not frappe.db.exists("Supplier", party_name):
             doc = frappe.get_doc({
                 "doctype": "Supplier",
-                "supplier_name": party.strip(),
+                "supplier_name": party_name.strip(),
                 "supplier_group": "All Supplier Groups",
                 "country": "Pakistan"
             })
             doc.insert(ignore_permissions=True)
             frappe.db.commit()
-            extracted["party"] = doc.name
+            self.party = doc.name
+        else:
+            self.party = party_name
 
-        self.db_set("party", extracted["party"])
-        self.extracted_data = json.dumps(extracted, indent=2)
         self.save()
 
     def create_invoice_from_child(self):
         extracted = json.loads(self.extracted_data or '{}')
-        items = extracted.get("items", [])
-        party = extracted.get("party")
+        items = extracted.get("invoice_lines", [])
+        party = self.party
 
         if not items:
             frappe.throw("No items found. Please extract first.")
-
-        self.ensure_party_exists()
 
         if not self.party:
             frappe.throw("Unable to determine or create party.")
@@ -134,14 +133,18 @@ class InvoiceUpload(Document):
         expense_account = self.get_expense_account()
 
         for row in items:
-            item_code = frappe.db.get_value("Item", {"item_name": row["description"]})
+            description = row.get("product", "")
+            qty = row.get("quantity", 0)
+            rate = row.get("price_unit", 0)
+            
+            item_code = frappe.db.get_value("Item", {"item_name": description})
             if not item_code:
-                item_code = self.ensure_item_exists(row["description"])
+                item_code = self.ensure_item_exists(description)
 
             inv.append("items", {
                 "item_code": item_code,
-                "qty": row["qty"],
-                "rate": row["rate"],
+                "qty": qty,
+                "rate": rate,
                 "uom": "Nos",
                 "expense_account": expense_account
             })
@@ -181,73 +184,198 @@ class InvoiceUpload(Document):
             item_code = item.name
         return item_code
 
-    def extract_items(self, text):
-        items = []
-        # Simplified and robust item extraction
-        lines = text.splitlines()
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            # Look for quantity pattern
-            qty_match = re.search(r'([\d,]+\.\d{3})\s*(kg|Units)', line)
-            if qty_match:
-                # Find description in previous lines
-                description = ""
-                j = i - 1
-                while j >= 0 and j >= i - 3:
-                    if lines[j].strip() and not re.search(r'QUANTITY|UNIT PRICE|AMOUNT|DESCRIPTION', lines[j], re.IGNORECASE):
-                        description = lines[j].strip()
-                        break
-                    j -= 1
-                
-                # Find rate in current or next lines
-                rate = None
-                rate_match = re.search(r'([\d,]+\.\d{3})(?!.*(?:kg|Units))', line)
-                if not rate_match:
-                    # Check next 2 lines for rate
-                    for k in range(i+1, min(i+3, len(lines))):
-                        rate_match = re.search(r'([\d,]+\.\d{3})', lines[k])
-                        if rate_match:
-                            rate = rate_match.group(1)
-                            break
-                else:
-                    rate = rate_match.group(1)
-                
-                if description and rate:
-                    try:
-                        items.append({
-                            "description": description,
-                            "qty": float(qty_match.group(1).replace(',', '')),
-                            "rate": float(rate.replace(',', ''))
-                        })
-                    except:
-                        pass
-            i += 1
-        return items
+    def _parse_attachment(self, file_content):
+        """Parse file content and return extracted text"""
+        try:
+            # Try to read as PDF first
+            try:
+                reader = PdfReader(io.BytesIO(file_content))
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text()
+                if text.strip():
+                    return text
+            except:
+                pass
 
-    def extract_party(self, text):
-        # Simplified party extraction
-        # 1. Look for Source field
-        source_match = re.search(r'Source:\s*([^\n|]+)', text, re.IGNORECASE)
-        if source_match:
-            return source_match.group(1).strip()
+            # If PDF extraction failed, try OCR
+            try:
+                # Convert PDF to images
+                images = convert_from_bytes(file_content)
+                text = ""
+                for img in images:
+                    processed = self._preprocess_image(img)
+                    text += pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
+                return text
+            except:
+                # Handle image files directly
+                try:
+                    img = Image.open(io.BytesIO(file_content))
+                    processed = self._preprocess_image(img)
+                    return pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
+                except:
+                    frappe.log_error("Failed to parse file content")
+                    return ""
+        except Exception as e:
+            frappe.log_error(f"Error parsing attachment: {str(e)}")
+            return ""
+
+    def _preprocess_image(self, img):
+        """Enhanced image preprocessing"""
+        try:
+            img_array = np.asarray(img)
+            channels = img_array.shape[-1] if img_array.ndim == 3 else 1
+
+            if channels == 3:
+                # Convert to grayscale
+                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = img_array
+
+            # Enhance resolution
+            scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            
+            # Apply CLAHE for contrast enhancement
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(scaled)
+            
+            # Apply adaptive thresholding
+            thresh = cv2.adaptiveThreshold(
+                enhanced, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 15, 10
+            )
+            
+            # Apply erosion to reduce noise
+            kernel = np.ones((3, 3), np.uint8)
+            processed = cv2.erode(thresh, kernel, iterations=1)
+            
+            return processed
+        except:
+            return img
+
+    def extract_values_with_ai(self, text):
+        """Extract structured data using AI approach"""
+        try:
+            # Prepare system prompt
+            system_prompt = self._ai_system_prompt()
+            
+            # Prepare user prompt
+            user_prompt = self._ai_user_prompt(text)
+            
+            # Call AI service
+            response = self._make_ai_request(system_prompt, user_prompt)
+            
+            # Parse and return response
+            return json.loads(response)
+        except Exception as e:
+            frappe.log_error(f"AI extraction failed: {str(e)}\n{traceback.format_exc()}")
+            return None
+
+    def _ai_system_prompt(self):
+        """Generate system prompt for AI"""
+        party_type = "vendor" if self.party_type == "Supplier" else "customer"
+        document_type = "invoice" if self.party_type == "Customer" else "bill"
         
-        # 2. Look for Payment Communication
-        payment_match = re.search(r'Payment\s+Communication:\s*([^\n]+)', text, re.IGNORECASE)
-        if payment_match:
-            return payment_match.group(1).strip()
+        return f"""
+        You are an invoice digitizer. Extract values from the provided document and return valid JSON.
+        The document is a {party_type} {document_type} for {frappe.db.get_value("Company", frappe.defaults.get_user_default("Company"), "company_name")}.
+        Extract the following information:
+        - Partner details (name, vat_id, email)
+        - Invoice number, date, due date
+        - Line items (product, quantity, price_unit, discount, tax_rate)
+        - Notes
         
-        # 3. Look for Order number
-        order_match = re.search(r'Order\s*[#:]\s*([^\s]+)', text, re.IGNORECASE)
-        if order_match:
-            return order_match.group(1).strip()
+        Return only a valid JSON object with this structure:
+        {{
+            "partner": {{
+                "name": "String",
+                "vat_id": "String",
+                "email": "String"
+            }},
+            "invoice_number": "String",
+            "invoice_date": "YYYY-MM-DD",
+            "due_date": "YYYY-MM-DD",
+            "invoice_lines": [
+                {{
+                    "product": "String",
+                    "quantity": Float,
+                    "price_unit": Float,
+                    "discount": Float,
+                    "tax_rate": Float
+                }}
+            ],
+            "notes": "String"
+        }}
+        """
+
+    def _ai_user_prompt(self, text):
+        """Prepare user prompt for AI"""
+        return f"""
+        Extract information from this document:
         
-        # 4. Look for Invoice number pattern
-        inv_match = re.search(r'Invoice\s+([A-Z]+/\d{4}/\d+)', text, re.IGNORECASE)
-        if inv_match:
-            return inv_match.group(1).strip()
+        {text[:5000]}  # Truncate to avoid token limits
+        """
+
+    def _make_ai_request(self, system_prompt, user_prompt):
+        """Make request to AI service (placeholder implementation)"""
+        # In a real implementation, this would call an AI API
+        # For now, we'll simulate with a regex-based fallback
         
-        return None
+        # Fallback to regex extraction if AI service is not available
+        return json.dumps(self.fallback_extraction(user_prompt))
+
+    def fallback_extraction(self, text):
+        """Fallback extraction method when AI is not available"""
+        # Extract party name
+        party_name = None
+        party_matches = re.findall(r'(?:Customer|Vendor|Supplier|Buyer|Client):?\s*([^\n]+)', text, re.IGNORECASE)
+        if party_matches:
+            party_name = party_matches[0].strip()
+        
+        # Extract items
+        items = []
+        # Look for quantity patterns
+        qty_matches = re.finditer(r'(\d+\.\d+)\s*(kg|Units|PCS|pcs|kg|Kg)', text)
+        for match in qty_matches:
+            qty = float(match.group(1))
+            unit = match.group(2)
+            
+            # Find description in previous lines
+            lines = text.splitlines()
+            line_index = text[:match.start()].count('\n')
+            description = ""
+            for i in range(max(0, line_index-3), line_index):
+                if lines[i].strip() and not re.search(r'QUANTITY|PRICE|AMOUNT|TOTAL', lines[i], re.IGNORECASE):
+                    description = lines[i].strip()
+                    break
+            
+            # Find price in surrounding area
+            price = None
+            price_match = re.search(r'(\d+\.\d{2,3})', text[match.end():match.end()+100])
+            if price_match:
+                price = float(price_match.group(1))
+            
+            if description and price:
+                items.append({
+                    "product": description,
+                    "quantity": qty,
+                    "price_unit": price
+                })
+        
+        # Extract dates
+        dates = re.findall(r'\d{2,4}[-/]\d{1,2}[-/]\d{1,4}', text)
+        invoice_date = dates[0] if dates else None
+        due_date = dates[1] if len(dates) > 1 else None
+        
+        return {
+            "partner": {
+                "name": party_name or "Unknown"
+            },
+            "invoice_lines": items,
+            "invoice_date": invoice_date,
+            "due_date": due_date
+        }
 
 
 @frappe.whitelist()
@@ -260,29 +388,8 @@ def extract_invoice(docname):
 def debug_ocr_preview(docname):
     doc = frappe.get_doc("Invoice Upload", docname)
     file_path = get_file_path(doc.file)
-
-    def preprocess_image(pil_img):
-        img = np.array(pil_img.convert("RGB"))
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        scaled = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(scaled)
-        thresh = cv2.adaptiveThreshold(
-            enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 15, 10
-        )
-        return thresh
-
-    text = ""
-    if file_path.endswith(".pdf"):
-        images = convert_from_path(file_path, dpi=300)
-        for img in images:
-            processed = preprocess_image(img)
-            text += pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
-    else:
-        img = Image.open(file_path)
-        processed = preprocess_image(img)
-        text = pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
-
-    return text[:2000]  # Limit output to first 2000 characters
+    file_content = frappe.get_doc("File", {"file_url": doc.file}).get_content()
+    
+    # Use the new parsing method
+    text = doc._parse_attachment(file_content)
+    return text[:2000]  # Limit output
