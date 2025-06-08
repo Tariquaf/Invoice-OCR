@@ -41,21 +41,32 @@ Install required system packages:
 
 ```bash
 sudo apt update
-sudo apt install -y poppler-utils tesseract-ocr tesseract-ocr-urd
+sudo apt install tesseract-ocr libtesseract-dev tesseract-ocr-eng tesseract-ocr-urd
+sudo apt install poppler-utils  # For PDF processing
+sudo apt install libgl1-mesa-glx  # For OpenCV
 
 # Get the app from GitHub
 
-bench get-app https://github.com/Mohtashim-1/Invoice-OCR.git
+[bench get-app https://github.com/Tariquaf/Invoice-OCR.git
+
 # Activate your Frappe virtual environment
+
 source ~/frappe-bench/env/bin/activate
 
 # Install required Python libraries
+
 pip install -r apps/invoice_ocr/requirements.txt
 
 # Or manually install requirements
-pip install pytesseract pdf2image Pillow PyPDF2 easyocr opencv-python
+
+pip install opencv-python-headless pytesseract numpy PyPDF2 pdf2image Pillow requests
+
+# Verify dependencies
+
+python3 ~/frappe-bench/apps/invoice_ocr/verify_dep.py
 
 # Deactivate virtual enviroment
+
 deactivate
 
 # 4. Install the app on your site
