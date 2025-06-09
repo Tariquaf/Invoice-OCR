@@ -101,21 +101,32 @@ class InvoiceUpload(Document):
             all_items = self.get_items_for_matching()
             
             self.set("invoice_upload_item", [])
-            for row in items:
+            for idx, row in enumerate(items):
                 # First try to match text in square brackets (item codes)
                 bracket_match = None
                 bracket_text = self.extract_bracket_text(row["description"])
                 
+                # Try matching with bracket text first
                 if bracket_text:
                     bracket_match = self.fuzzy_match_item(bracket_text, all_items)
+                    if bracket_match and bracket_match["score"] > 85:
+                        matched_item = bracket_match["item_name"]
+                        self.append("invoice_upload_item", {
+                            "ocr_description": row["description"],
+                            "qty": row["qty"],
+                            "rate": row["rate"],
+                            "item": matched_item
+                        })
+                        continue
                 
-                # If bracket match found with high confidence, use it
-                if bracket_match and bracket_match["score"] > 85:
-                    matched_item = bracket_match["name"]
+                # If bracket match not found, try full description
+                full_match = self.fuzzy_match_item(row["description"], all_items)
+                if full_match and full_match["score"] > 75:
+                    matched_item = full_match["item_name"]
                 else:
-                    # Otherwise, match the full description
-                    full_match = self.fuzzy_match_item(row["description"], all_items)
-                    matched_item = full_match["name"] if full_match and full_match["score"] > 75 else None
+                    matched_item = None
+                    # Log unmatched item
+                    frappe.log_error(f"Unmatched item: {row['description']}", "Item Matching Debug")
                 
                 self.append("invoice_upload_item", {
                     "ocr_description": row["description"],
@@ -132,6 +143,7 @@ class InvoiceUpload(Document):
                     extracted_data["party"] = party_match["name"]
                 else:
                     extracted_data["party"] = party_name
+                    frappe.log_error(f"Unmatched party: {party_name}", "Party Matching Debug")
 
             self.extracted_data = json.dumps(extracted_data, indent=2)
             self.ocr_status = "Extracted"
@@ -213,6 +225,7 @@ class InvoiceUpload(Document):
                 items_added += 1
             except Exception as e:
                 frappe.msgprint(f"Error adding item {item_code}: {str(e)}", alert=True, indicator="red")
+                frappe.log_error(f"Item add failed: {item_code} - {str(e)}", "Invoice Creation Error")
 
         if items_added == 0:
             frappe.throw("No valid items found to create invoice")
@@ -406,24 +419,32 @@ class InvoiceUpload(Document):
 
     def get_items_for_matching(self):
         """Get all items with their names and codes for matching"""
+        # Get all active items
         items = frappe.get_all("Item", 
-                              fields=["name", "item_name", "item_code"],
+                              fields=["item_code", "item_name"],
                               filters={"disabled": 0})
         
         # Create a list of all possible names and codes
         item_data = []
         for item in items:
-            item_data.append({
-                "name": item.name,  # THIS IS WRONG
-                "match_text": item.item_name.lower(),
-                "type": "name"
-            })
-            if item.item_code and item.item_code != item.item_name:
+            # Add item code as primary identifier
+            if item.item_code:
                 item_data.append({
-                    "name": item.name,  # THIS IS WRONG
+                    "item_name": item.item_code,  # Actual item code
                     "match_text": item.item_code.lower(),
                     "type": "code"
                 })
+            
+            # Add item name as secondary identifier
+            if item.item_name and item.item_name.lower() != item.item_code.lower():
+                item_data.append({
+                    "item_name": item.item_code,  # Still use item code as identifier
+                    "match_text": item.item_name.lower(),
+                    "type": "name"
+                })
+        
+        # Log only the count to avoid long messages
+        frappe.log_error(f"Item count for matching: {len(item_data)}", "Item Matching Debug")
         return item_data
     
     def extract_bracket_text(self, description):
@@ -436,23 +457,41 @@ class InvoiceUpload(Document):
         if not text:
             return None
             
-        clean_text = text.lower().strip()
+        # Clean the text by removing special characters for better matching
+        clean_text = re.sub(r'[^\w\s]', '', text).lower().strip()
         best_match = None
         best_score = 0
         
         for item in all_items:
-            score = difflib.SequenceMatcher(None, clean_text, item["match_text"]).ratio() * 100
+            # Clean the match text similarly
+            clean_match_text = re.sub(r'[^\w\s]', '', item["match_text"])
+            
+            # Calculate similarity score
+            score = difflib.SequenceMatcher(None, clean_text, clean_match_text).ratio() * 100
+            
+            # Give extra weight to code matches
+            if item["type"] == "code":
+                score = min(score * 1.2, 100)  # Boost code matches by 20%
+                
             if score > best_score:
                 best_score = score
                 best_match = {
-                    "name": item["name"],
+                    "item_name": item["item_name"],  # Actual item code
                     "score": score,
                     "match_type": item["type"],
                     "match_text": item["match_text"]
                 }
         
         # Return match only if it meets minimum confidence
-        return best_match if best_score > 70 else None
+        if best_score > 70:
+            return best_match
+            
+        # Try again with bracket extraction if first match failed
+        bracket_text = self.extract_bracket_text(text)
+        if bracket_text:
+            return self.fuzzy_match_item(bracket_text, all_items)
+            
+        return None
 
     def fuzzy_match_party(self, party_name):
         """Fuzzy match party against existing parties"""
