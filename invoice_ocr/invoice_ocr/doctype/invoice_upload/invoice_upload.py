@@ -414,13 +414,13 @@ class InvoiceUpload(Document):
         item_data = []
         for item in items:
             item_data.append({
-                "name": item.name,
+                "name": item.name,  # THIS IS WRONG
                 "match_text": item.item_name.lower(),
                 "type": "name"
             })
             if item.item_code and item.item_code != item.item_name:
                 item_data.append({
-                    "name": item.name,
+                    "name": item.name,  # THIS IS WRONG
                     "match_text": item.item_code.lower(),
                     "type": "code"
                 })
