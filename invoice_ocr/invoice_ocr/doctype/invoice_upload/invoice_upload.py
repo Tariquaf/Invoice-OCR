@@ -18,13 +18,21 @@ class InvoiceUpload(Document):
     def on_submit(self):
         try:
             self.reload()
-            self.create_invoice_from_child()
+            # Create draft invoice on submit
+            self.create_invoice_from_child(submit_invoice=False)
+            # Make document non-editable
+            frappe.db.set_value("Invoice Upload", self.name, "docstatus", 1)
         except Exception as e:
             frappe.db.set_value("Invoice Upload", self.name, "ocr_status", "Failed")
             frappe.db.commit()
             error_message = f"Invoice Creation Failed: {str(e)}\n{traceback.format_exc()}"
             frappe.log_error(error_message, "Invoice Creation Failed")
             frappe.throw(f"Invoice creation failed: {str(e)}")
+
+    def before_save(self):
+        # Make submitted documents read-only
+        if self.docstatus == 1:
+            self.flags.read_only = True
 
     def extract_invoice(self):
         try:
@@ -147,83 +155,94 @@ class InvoiceUpload(Document):
         if not party or not party.strip():
             frappe.throw("Party is missing. Cannot create invoice.")
         
-        # Check if party is already an ID
+        # Check if party exists
         if frappe.db.exists(self.party_type, party):
             self.party = party
             return
             
-        # Try fuzzy matching again in case of new parties
+        # Try fuzzy matching again in case of close matches
         party_match = self.fuzzy_match_party(party)
         if party_match:
             self.party = party_match["name"]
             return
 
-        # Create new party if no match found
-        if self.party_type == "Customer" and not frappe.db.exists("Customer", party):
-            doc = frappe.get_doc({
-                "doctype": "Customer",
-                "customer_name": party.strip(),
-                "customer_group": "All Customer Groups",
-                "territory": "All Territories"
-            })
-            doc.insert(ignore_permissions=True)
-            frappe.db.commit()
-            self.party = doc.name
+        # If no match found, throw error
+        frappe.throw(f"Party '{party}' not found in the system. Please create it first.")
 
-        elif self.party_type == "Supplier" and not frappe.db.exists("Supplier", party):
-            doc = frappe.get_doc({
-                "doctype": "Supplier",
-                "supplier_name": party.strip(),
-                "supplier_group": "All Supplier Groups",
-                "country": "Pakistan"
-            })
-            doc.insert(ignore_permissions=True)
-            frappe.db.commit()
-            self.party = doc.name
-
-        self.save()
-
-    def create_invoice_from_child(self):
-        extracted = json.loads(self.extracted_data or '{}')
-        items = extracted.get("items", [])
-        party = extracted.get("party")
-
-        if not items:
-            frappe.throw("No items found. Please extract first.")
-
+    def create_invoice_from_child(self, submit_invoice=False):
+        """Create invoice, optionally submit it based on parameter"""
+        # Check if invoice already created
+        if self.invoice_created:
+            frappe.throw("Invoice already created for this document")
+            
+        # Ensure party is set and exists
         self.ensure_party_exists()
 
-        if not self.party:
-            frappe.throw("Unable to determine or create party.")
-
+        # Create the appropriate invoice type
         if self.party_type == "Supplier":
             inv = frappe.new_doc("Purchase Invoice")
             inv.supplier = self.party
+            inv.bill_no = self.name
+            inv.bill_date = self.date
         else:
             inv = frappe.new_doc("Sales Invoice")
             inv.customer = self.party
 
         expense_account = self.get_expense_account()
 
+        # Add items from the child table
+        items_added = 0
         for row in self.invoice_upload_item:
             item_code = row.item
             if not item_code:
-                item_code = self.ensure_item_exists(row.ocr_description)
+                frappe.msgprint(f"Skipping item: {row.ocr_description} - no item matched", alert=True)
+                continue
 
-            inv.append("items", {
-                "item_code": item_code,
-                "qty": row.qty,
-                "rate": row.rate,
-                "uom": "Nos",
-                "expense_account": expense_account
-            })
+            try:
+                # Get item details
+                item_doc = frappe.get_doc("Item", item_code)
+                inv.append("items", {
+                    "item_code": item_code,
+                    "item_name": item_doc.item_name,
+                    "description": item_doc.description or row.ocr_description,
+                    "qty": row.qty,
+                    "rate": row.rate,
+                    "uom": item_doc.stock_uom or "Nos",
+                    "expense_account": expense_account
+                })
+                items_added += 1
+            except Exception as e:
+                frappe.msgprint(f"Error adding item {item_code}: {str(e)}", alert=True, indicator="red")
 
+        if items_added == 0:
+            frappe.throw("No valid items found to create invoice")
+
+        # Set dates
         posting_date = getattr(self, "posting_date", None) or nowdate()
         inv.posting_date = posting_date
         inv.due_date = add_days(posting_date, 30)
-        inv.insert(ignore_permissions=True)
+        
+        # Save invoice with appropriate validation
+        try:
+            # Bypass validations for draft invoices
+            inv.flags.ignore_validate = True
+            inv.flags.ignore_mandatory = True
+            inv.insert(ignore_permissions=True)
+            status = "Draft"
+        except Exception as e:
+            frappe.msgprint(f"Invoice creation failed: {str(e)}", alert=True, indicator="red")
+            frappe.log_error(f"Invoice creation failed: {str(e)}", "Invoice Creation Error")
+            return
+        
+        # Update status and reference
+        frappe.db.set_value(self.doctype, self.name, {
+            "invoice_created": 1,
+            "invoice_reference": inv.name,
+            "invoice_type": inv.doctype,
+            "invoice_status": status
+        })
 
-        frappe.msgprint(f"<a href='{get_url_to_form(inv.doctype, inv.name)}'>{inv.name}</a> created")
+        frappe.msgprint(f"<a href='{get_url_to_form(inv.doctype, inv.name)}'>{inv.name}</a> created ({status})")
 
     def get_expense_account(self):
         company = frappe.defaults.get_user_default("Company")
@@ -237,38 +256,6 @@ class InvoiceUpload(Document):
         if not account:
             frappe.throw("No default Expense Account found for the company.")
         return account
-
-    def ensure_item_exists(self, description):
-        """Create item if it doesn't exist, handling special characters"""
-        # Clean description to remove special characters
-        cleaned_description = re.sub(r'[^\w\s\.\-\(\)\/]', '', description)[:140]
-        
-        # Try to find existing item by cleaned name
-        item_code = frappe.db.get_value("Item", {"item_name": cleaned_description})
-        
-        if not item_code:
-            # Create a safe item code
-            safe_item_code = re.sub(r'[^\w\-]', '_', cleaned_description)[:130]
-            
-            # Ensure unique item code
-            base_code = safe_item_code
-            counter = 1
-            while frappe.db.exists("Item", safe_item_code):
-                safe_item_code = f"{base_code}_{counter}"
-                counter += 1
-            
-            item = frappe.get_doc({
-                "doctype": "Item",
-                "item_name": cleaned_description,
-                "item_code": safe_item_code,
-                "item_group": "All Item Groups",
-                "stock_uom": "Nos",
-                "is_stock_item": 0
-            })
-            item.insert(ignore_permissions=True)
-            item_code = item.name
-        
-        return item_code
 
     def extract_items(self, text):
         # First try to extract as bill of charges
@@ -396,8 +383,8 @@ class InvoiceUpload(Document):
         if order_match:
             return order_match.group(1).strip()
         
-        # 6. Look for customer/supplier blocks
-        party_labels = ["Customer", "Supplier", "Vendor", "Client", "Bill To", "Sold To"]
+        # 6. Look for customer/supplier blocks - ADDED "PARTNER"
+        party_labels = ["Customer", "Supplier", "Vendor", "Client", "Bill To", "Sold To", "Partner"]
         for label in party_labels:
             # Pattern 1: "Label: Value"
             pattern1 = re.compile(fr'{label}\s*:\s*(\w[\w\s\-]+)', re.IGNORECASE)
@@ -509,6 +496,24 @@ def extract_invoice(docname):
         return result
     except Exception as e:
         frappe.log_error(f"Extract invoice failed: {str(e)}", "Extract Invoice Error")
+        return {"status": "error", "message": str(e)}
+
+
+@frappe.whitelist()
+def create_invoice(docname, submit_invoice=False):
+    """Create invoice from the Create Invoice button"""
+    try:
+        doc = frappe.get_doc("Invoice Upload", docname)
+        # Create draft invoice by default
+        doc.create_invoice_from_child(submit_invoice=submit_invoice)
+        return {
+            "status": "success",
+            "invoice_name": doc.invoice_reference,
+            "doctype": doc.invoice_type,
+            "status": doc.invoice_status
+        }
+    except Exception as e:
+        frappe.log_error(f"Create invoice failed: {str(e)}", "Create Invoice Error")
         return {"status": "error", "message": str(e)}
 
 
