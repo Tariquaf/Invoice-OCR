@@ -378,8 +378,11 @@ class InvoiceUpload(Document):
             return consignee_match.group(1).strip()
 
         # 2. Clean the text for better matching
-        clean_text = re.sub(r'[^\w\s\-:]', ' ', text)  # Remove special chars
-        clean_text = re.sub(r'\s+', ' ', clean_text)  # Normalize whitespace
+        # clean_text = re.sub(r'[^\w\s\-:]', ' ', text)  # Remove special chars
+        # clean_text = re.sub(r'\s+', ' ', clean_text)  # Normalize whitespace
+
+        clean_text = re.sub(r'[^\w\s\-:\n]', ' ', text)
+        clean_text = re.sub
         
         # 3. Try to extract from Source field
         source_match = re.search(r'Source\s*:\s*(\w[\w\s\-]+)', clean_text, re.IGNORECASE)
