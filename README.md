@@ -13,7 +13,7 @@ This repository offers a significantly improved version of the Invoice OCR tool,
 
 ## 🧠 Core Logic Overview
 
-The `invoice_upload-2.py` script defines a Frappe DocType `InvoiceUpload` that:
+The script defines a Frappe DocType `InvoiceUpload` that:
 
 - Extracts text from uploaded PDFs or images using `pytesseract`
 - Parses invoice data: number, date, totals, line-items
@@ -32,7 +32,7 @@ The `invoice_upload-2.py` script defines a Frappe DocType `InvoiceUpload` that:
 
 ---
 
-## ⚙️ Full Installation Guide
+## ⚙️ Full Installation Guide & How to Use
 
 ### ✅ 1. Prerequisites
 
@@ -85,6 +85,3 @@ bench start #for development
 - Click attach button and attach/select invoice
 - A button "Extract from File" will appear on top
 - Save and submit after verification. It will create a draft invoice and further amendments can be made in draft invoice.
-
-
-
