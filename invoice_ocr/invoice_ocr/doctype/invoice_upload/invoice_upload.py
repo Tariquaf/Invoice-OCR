@@ -18,13 +18,21 @@ class InvoiceUpload(Document):
     def on_submit(self):
         try:
             self.reload()
-            self.create_invoice_from_child()
+            # Create draft invoice on submit
+            self.create_invoice_from_child(submit_invoice=False)
+            # Make document non-editable
+            frappe.db.set_value("Invoice Upload", self.name, "docstatus", 1)
         except Exception as e:
             frappe.db.set_value("Invoice Upload", self.name, "ocr_status", "Failed")
             frappe.db.commit()
             error_message = f"Invoice Creation Failed: {str(e)}\n{traceback.format_exc()}"
             frappe.log_error(error_message, "Invoice Creation Failed")
             frappe.throw(f"Invoice creation failed: {str(e)}")
+
+    def before_save(self):
+        # Make submitted documents read-only
+        if self.docstatus == 1:
+            self.flags.read_only = True
 
     def extract_invoice(self):
         try:
@@ -93,22 +101,45 @@ class InvoiceUpload(Document):
             all_items = self.get_items_for_matching()
             
             self.set("invoice_upload_item", [])
+            seen_descriptions = set()  # Track seen descriptions to avoid duplicates
+            
             for row in items:
+                # Skip empty or invalid descriptions
+                if not row["description"] or len(row["description"]) < 3:
+                    continue
+                    
+                # Normalize description for duplicate check
+                normalized_desc = re.sub(r'\W+', '', row["description"].lower())
+                
+                # Skip duplicate items
+                if normalized_desc in seen_descriptions:
+                    continue
+                seen_descriptions.add(normalized_desc)
+                
                 # First try to match text in square brackets (item codes)
                 bracket_match = None
                 bracket_text = self.extract_bracket_text(row["description"])
                 
+                # Try matching with bracket text first
                 if bracket_text:
                     bracket_match = self.fuzzy_match_item(bracket_text, all_items)
+                    if bracket_match and bracket_match["score"] > 85:
+                        matched_item = bracket_match["item_name"]
+                        self.append("invoice_upload_item", {
+                            "ocr_description": row["description"],
+                            "qty": row["qty"],
+                            "rate": row["rate"],
+                            "item": matched_item
+                        })
+                        continue
                 
-                # If bracket match found with high confidence, use it
-                if bracket_match and bracket_match["score"] > 85:
-                    matched_item = bracket_match["name"]
+                # If bracket match not found, try full description
+                full_match = self.fuzzy_match_item(row["description"], all_items)
+                if full_match and full_match["score"] > 75:
+                    matched_item = full_match["item_name"]
                 else:
-                    # Otherwise, match the full description
-                    full_match = self.fuzzy_match_item(row["description"], all_items)
-                    matched_item = full_match["name"] if full_match and full_match["score"] > 75 else None
-                
+                    matched_item = None
+                    
                 self.append("invoice_upload_item", {
                     "ocr_description": row["description"],
                     "qty": row["qty"],
@@ -147,83 +178,110 @@ class InvoiceUpload(Document):
         if not party or not party.strip():
             frappe.throw("Party is missing. Cannot create invoice.")
         
-        # Check if party is already an ID
+        # Check if party exists
         if frappe.db.exists(self.party_type, party):
             self.party = party
             return
             
-        # Try fuzzy matching again in case of new parties
+        # Try fuzzy matching again in case of close matches
         party_match = self.fuzzy_match_party(party)
         if party_match:
             self.party = party_match["name"]
             return
 
-        # Create new party if no match found
-        if self.party_type == "Customer" and not frappe.db.exists("Customer", party):
-            doc = frappe.get_doc({
-                "doctype": "Customer",
-                "customer_name": party.strip(),
-                "customer_group": "All Customer Groups",
-                "territory": "All Territories"
-            })
-            doc.insert(ignore_permissions=True)
-            frappe.db.commit()
-            self.party = doc.name
+        # If no match found, throw error
+        frappe.throw(f"Party '{party}' not found in the system. Please create it first.")
 
-        elif self.party_type == "Supplier" and not frappe.db.exists("Supplier", party):
-            doc = frappe.get_doc({
-                "doctype": "Supplier",
-                "supplier_name": party.strip(),
-                "supplier_group": "All Supplier Groups",
-                "country": "Pakistan"
-            })
-            doc.insert(ignore_permissions=True)
-            frappe.db.commit()
-            self.party = doc.name
-
-        self.save()
-
-    def create_invoice_from_child(self):
-        extracted = json.loads(self.extracted_data or '{}')
-        items = extracted.get("items", [])
-        party = extracted.get("party")
-
-        if not items:
-            frappe.throw("No items found. Please extract first.")
-
+    def create_invoice_from_child(self, submit_invoice=False):
+        """Create invoice, optionally submit it based on parameter"""
+        # Check if invoice already created
+        if self.invoice_created:
+            frappe.throw("Invoice already created for this document")
+            
+        # Ensure party is set and exists
         self.ensure_party_exists()
 
-        if not self.party:
-            frappe.throw("Unable to determine or create party.")
-
+        # Create the appropriate invoice type
         if self.party_type == "Supplier":
             inv = frappe.new_doc("Purchase Invoice")
             inv.supplier = self.party
+            inv.bill_no = self.name
+            inv.bill_date = self.date
         else:
             inv = frappe.new_doc("Sales Invoice")
             inv.customer = self.party
 
-        expense_account = self.get_expense_account()
+        # Get appropriate account based on invoice type
+        if self.party_type == "Supplier":
+            account = self.get_expense_account()
+            account_field = "expense_account"
+        else:
+            account = self.get_income_account()
+            account_field = "income_account"
 
+        # Add items from the child table
+        items_added = 0
         for row in self.invoice_upload_item:
             item_code = row.item
             if not item_code:
-                item_code = self.ensure_item_exists(row.ocr_description)
+                frappe.msgprint(f"Skipping item: {row.ocr_description} - no item matched", alert=True)
+                continue
 
-            inv.append("items", {
-                "item_code": item_code,
-                "qty": row.qty,
-                "rate": row.rate,
-                "uom": "Nos",
-                "expense_account": expense_account
-            })
+            try:
+                # Get item details
+                item_doc = frappe.get_doc("Item", item_code)
+                
+                # Create item dictionary
+                item_dict = {
+                    "item_code": item_code,
+                    "item_name": item_doc.item_name,
+                    "description": item_doc.description or row.ocr_description,
+                    "qty": row.qty,
+                    "rate": row.rate,
+                    "uom": item_doc.stock_uom or "Nos"
+                }
+                
+                # Set account field based on invoice type
+                item_dict[account_field] = account
+                
+                inv.append("items", item_dict)
+                items_added += 1
+            except Exception as e:
+                frappe.msgprint(f"Error adding item {item_code}: {str(e)}", alert=True, indicator="red")
 
+        if items_added == 0:
+            frappe.throw("No valid items found to create invoice")
+
+        # Set dates
         posting_date = getattr(self, "posting_date", None) or nowdate()
         inv.posting_date = posting_date
         inv.due_date = add_days(posting_date, 30)
-        inv.insert(ignore_permissions=True)
+        
+        # Calculate totals
+        inv.run_method("set_missing_values")
+        inv.run_method("calculate_taxes_and_totals")
+        
+        # Save invoice with appropriate validation
+        try:
+            # Bypass validations for draft invoices
+            inv.flags.ignore_validate = True
+            inv.flags.ignore_mandatory = True
+            inv.insert(ignore_permissions=True)
+            status = "Draft"
+        except Exception as e:
+            frappe.msgprint(f"Invoice creation failed: {str(e)}", alert=True, indicator="red")
+            frappe.log_error(f"Invoice creation failed: {str(e)}", "Invoice Creation Error")
+            return
+        
+        # Update status and reference
+        frappe.db.set_value(self.doctype, self.name, {
+            "invoice_created": 1,
+            "invoice_reference": inv.name,
+            "invoice_type": inv.doctype,
+            "invoice_status": status
+        })
 
-        frappe.msgprint(f"<a href='{get_url_to_form(inv.doctype, inv.name)}'>{inv.name}</a> created")
+        frappe.msgprint(f"<a href='{get_url_to_form(inv.doctype, inv.name)}'>{inv.name}</a> created ({status})")
 
     def get_expense_account(self):
         company = frappe.defaults.get_user_default("Company")
@@ -238,47 +296,38 @@ class InvoiceUpload(Document):
             frappe.throw("No default Expense Account found for the company.")
         return account
 
-    def ensure_item_exists(self, description):
-        """Create item if it doesn't exist, handling special characters"""
-        # Clean description to remove special characters
-        cleaned_description = re.sub(r'[^\w\s\.\-\(\)\/]', '', description)[:140]
-        
-        # Try to find existing item by cleaned name
-        item_code = frappe.db.get_value("Item", {"item_name": cleaned_description})
-        
-        if not item_code:
-            # Create a safe item code
-            safe_item_code = re.sub(r'[^\w\-]', '_', cleaned_description)[:130]
-            
-            # Ensure unique item code
-            base_code = safe_item_code
-            counter = 1
-            while frappe.db.exists("Item", safe_item_code):
-                safe_item_code = f"{base_code}_{counter}"
-                counter += 1
-            
-            item = frappe.get_doc({
-                "doctype": "Item",
-                "item_name": cleaned_description,
-                "item_code": safe_item_code,
-                "item_group": "All Item Groups",
-                "stock_uom": "Nos",
-                "is_stock_item": 0
-            })
-            item.insert(ignore_permissions=True)
-            item_code = item.name
-        
-        return item_code
+    def get_income_account(self):
+        company = frappe.defaults.get_user_default("Company")
+        account = frappe.db.get_value("Company", company, "default_income_account")
+        if not account:
+            account = frappe.db.get_value("Account", {
+                "account_type": "Income",
+                "company": company,
+                "is_group": 0
+            }, "name")
+        if not account:
+            frappe.throw("No default Income Account found for the company.")
+        return account
 
     def extract_items(self, text):
+        # First try to extract as structured table items
+        table_items = self.extract_table_items(text)
+        if table_items:
+            return table_items
+
+        # Then try to extract as bill of charges
+        charge_items = self.extract_charges(text)
+        if charge_items:
+            return charge_items
+
+        # Fallback to original method if no structured data found
         items = []
         # Look for quantity patterns in the text
-        qty_matches = re.finditer(r'(\d+,\d+\.\d{3}|\d+\.\d{3})\s*(kg|Units)', text, re.IGNORECASE)
+        qty_matches = re.finditer(r'(\d+,\d+\.\d{3}|\d+\.\d{3}|\d+)\s*(kg|Units)?', text, re.IGNORECASE)
         
         for match in qty_matches:
             try:
                 qty_str = match.group(1).replace(',', '')
-                unit = match.group(2)
                 qty = float(qty_str)
                 
                 # Find description in previous lines
@@ -289,104 +338,238 @@ class InvoiceUpload(Document):
                 # Clean up description
                 description = re.sub(r'^\W+|\W+$', '', description)  # Remove surrounding symbols
                 description = re.sub(r'\s+', ' ', description)  # Collapse multiple spaces
+                description = re.sub(r'\.{3,}', '', description)  # Remove ellipses
+                
+                # Skip short descriptions
+                if len(description) < 3:
+                    continue
                 
                 # Find rate in the same line or next
-                rate_match = re.search(r'(\d+,\d+\.\d{3}|\d+\.\d{3})(?!.*(?:kg|Units))', 
+                rate_match = re.search(r'(\d+,\d+\.\d{2,3}|\d+\.\d{2,3}|\d+)', 
                                       text[match.start():match.start()+100])
-                rate = float(rate_match.group(1).replace(',', '')) if rate_match else 0.0
+                if rate_match:
+                    rate_str = rate_match.group(1).replace(',', '')
+                    rate = float(rate_str)
+                else:
+                    rate = 0.0
                 
-                if description:
+                items.append({
+                    "description": description,
+                    "qty": qty,
+                    "rate": rate
+                })
+            except Exception as e:
+                frappe.log_error(f"Item extraction failed: {str(e)}", "Item Extraction Error")
+                continue
+        
+        return items
+
+    def extract_table_items(self, text):
+        """Extract items from structured tables with pipe format"""
+        items = []
+        lines = text.splitlines()
+        
+        # Find the start of the items table
+        start_index = -1
+        for i, line in enumerate(lines):
+            if "QUANTITY" in line and "UNIT PRICE" in line and "AMOUNT" in line:
+                start_index = i + 1
+                break
+        
+        # If table header found, process subsequent lines
+        if start_index != -1:
+            for i in range(start_index, min(start_index + 10, len(lines))):
+                line = lines[i]
+                if not line.strip():
+                    break
+                
+                # Split line by pipe character
+                parts = [part.strip() for part in line.split('|')]
+                if len(parts) < 4:
+                    continue
+                
+                try:
+                    description = parts[0]
+                    qty_str = parts[1].replace(',', '')
+                    rate_str = parts[2].replace(',', '')
+                    
+                    # Extract quantity number
+                    qty_match = re.search(r'(\d+\.\d{3})', qty_str)
+                    if not qty_match:
+                        continue
+                    qty = float(qty_match.group(1))
+                    
+                    # Extract rate number
+                    rate_match = re.search(r'(\d+\.\d{2,3})', rate_str)
+                    if not rate_match:
+                        continue
+                    rate = float(rate_match.group(1))
+                    
+                    # Clean up description
+                    description = re.sub(r'\s+', ' ', description)  # Collapse spaces
+                    description = re.sub(r'\.{3,}', '', description)  # Remove ellipses
+                    description = re.sub(r'^\W+|\W+$', '', description)  # Remove surrounding symbols
+                    
+                    # Skip short descriptions
+                    if len(description) < 3:
+                        continue
+                    
                     items.append({
                         "description": description,
                         "qty": qty,
                         "rate": rate
                     })
-            except Exception as e:
-                frappe.log_error(f"Item extraction failed: {str(e)}", "Item Extraction Error")
-                continue
+                except Exception as e:
+                    continue
         
-        # If no items found, fallback to original method
+        # If no pipe items found, try alternative table format
         if not items:
-            lines = text.splitlines()
-            pattern = re.compile(r"(.+?)\s+(\d+\.\d{1,2})\s+(\d+\.\d{1,2})\s+\$?(\d+\.\d{1,2})")
+            # Pattern to match table rows without pipes
+            pattern = re.compile(
+                r'^(.+?)\s+(\d{1,3}(?:,\d{3})*\.\d{3})\s*(kg|Units)?\s+(\d{1,3}(?:,\d{3})*\.\d{2,3})\s+.*?\d+\.\d{2}',
+                re.IGNORECASE
+            )
+            
             for line in lines:
                 match = pattern.search(line)
                 if match:
                     try:
                         description = match.group(1).strip()
-                        qty = float(match.group(2))
-                        rate = float(match.group(3))
+                        qty = float(match.group(2).replace(',', ''))
+                        rate = float(match.group(4).replace(',', ''))
+                        
+                        # Clean up description
+                        description = re.sub(r'\s+', ' ', description)
+                        description = re.sub(r'\.{3,}', '', description)
+                        description = re.sub(r'^\W+|\W+$', '', description)
+                        
+                        if len(description) < 3:
+                            continue
+                            
                         items.append({
                             "description": description,
                             "qty": qty,
                             "rate": rate
                         })
-                    except:
+                    except Exception as e:
                         continue
         
         return items
 
-    def extract_party(self, text):
-        # Clean the text for better matching
-        clean_text = re.sub(r'[^\w\s\-:]', ' ', text)  # Remove special chars
-        clean_text = re.sub(r'\s+', ' ', clean_text)  # Normalize whitespace
+    def extract_charges(self, text):
+        """Extract items from bill of charges format"""
+        items = []
+        clean_text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
         
-        # 1. Try to extract from Source field (top priority)
-        source_match = re.search(r'Source\s*:\s*(\w[\w\s\-]+)', clean_text, re.IGNORECASE)
-        if source_match:
-            return source_match.group(1).strip()
-        
-        # 2. Try to extract from Payment Communication
-        payment_match = re.search(r'Payment\s+Communication\s*:\s*(\w[\w\s\-]+)', clean_text, re.IGNORECASE)
-        if payment_match:
-            return payment_match.group(1).strip()
-        
-        # 3. Try to extract from Order number
-        order_match = re.search(r'Order\s*[#:]\s*(\w[\w\s\-]+)', clean_text, re.IGNORECASE)
-        if order_match:
-            return order_match.group(1).strip()
-        
-        # 4. Look for customer/supplier blocks
-        party_labels = ["Customer", "Supplier", "Vendor", "Client", "Bill To", "Sold To"]
-        for label in party_labels:
-            # Pattern 1: "Label: Value"
-            pattern1 = re.compile(fr'{label}\s*:\s*(\w[\w\s\-]+)', re.IGNORECASE)
-            match1 = pattern1.search(clean_text)
-            if match1:
-                return match1.group(1).strip()
+        # Find the PARTICULARS section
+        start = clean_text.find("PARTICULARS")
+        if start == -1:
+            return items
+
+        # Extract table data
+        table_pattern = r'Custom Duties(.+?)Service Charges'
+        table_match = re.search(table_pattern, clean_text, re.DOTALL)
+        if not table_match:
+            return items
             
-            # Pattern 2: "Label" on one line, value on next line
-            pattern2 = re.compile(fr'{label}\s*[\n:]+', re.IGNORECASE)
-            match2 = pattern2.search(clean_text)
-            if match2:
-                # Get the next non-empty line
-                rest_text = clean_text[match2.end():]
-                next_line = rest_text.split('\n')[0].strip()
-                if next_line:
-                    return next_line.split()[0]  # Take first word of next line
+        table_text = table_match.group(1)
         
+        # Process each charge line
+        charge_pattern = r'(\w[\w\s\/-]+)\s+(\d{1,3}(?:,\d{3})*)\s+(\d{1,3}(?:,\d{3})*)'
+        for match in re.finditer(charge_pattern, table_text):
+            try:
+                charge_name = match.group(1).strip()
+                consignee_amount = float(match.group(2).replace(',', ''))
+                balance_amount = float(match.group(3).replace(',', ''))
+                total_amount = consignee_amount + balance_amount
+                
+                # Skip zero-amount lines
+                if total_amount > 0:
+                    items.append({
+                        "description": charge_name,
+                        "qty": 1,
+                        "rate": total_amount
+                    })
+            except Exception:
+                continue
+                
+        return items
+
+    def extract_party(self, text):
+        """Extract the actual partner name from the invoice"""
+        # 1. First look for explicit "Partner Name" field
+        partner_match = re.search(r'Partner\s*Name\s*:\s*([^\n]+)', text, re.IGNORECASE)
+        if partner_match:
+            party = partner_match.group(1).strip()
+            # Remove any trailing non-alphanumeric characters
+            party = re.sub(r'[^\w\s\-]$', '', party).strip()
+            if party:
+                return party
+
+        # 2. Look for the most prominent name in the top section
+        # This is usually the customer/supplier name
+        top_section = text.split("Invoice Date:")[0] if "Invoice Date:" in text else text[:500]
+        
+        # Find the longest word sequence that looks like a name
+        name_candidates = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', top_section)
+        if name_candidates:
+            # Get the longest candidate as it's likely the partner name
+            name_candidates.sort(key=len, reverse=True)
+            return name_candidates[0]
+
+        # 3. Look for other common labels
+        party_labels = ["Customer", "Client", "Supplier", "Vendor", "Bill To", "Sold To"]
+        for label in party_labels:
+            pattern = re.compile(fr'{label}\s*:\s*([^\n]+)', re.IGNORECASE)
+            match = pattern.search(text)
+            if match:
+                party = match.group(1).strip()
+                party = re.sub(r'[^\w\s\-]$', '', party).strip()
+                if party:
+                    return party
+
+        # 4. Look for a name-like string near the invoice title
+        title_match = re.search(r'Invoice\s+\w+/\d+/\d+', text, re.IGNORECASE)
+        if title_match:
+            # Look before and after the title for a name
+            start_pos = max(0, title_match.start() - 100)
+            end_pos = min(len(text), title_match.end() + 100)
+            context = text[start_pos:end_pos]
+            
+            # Find the most prominent name in this context
+            name_candidates = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', context)
+            if name_candidates:
+                name_candidates.sort(key=len, reverse=True)
+                return name_candidates[0]
+
         return None
 
     def get_items_for_matching(self):
         """Get all items with their names and codes for matching"""
+        # Get all active items
         items = frappe.get_all("Item", 
-                              fields=["name", "item_name", "item_code"],
+                              fields=["item_code", "item_name"],
                               filters={"disabled": 0})
         
         # Create a list of all possible names and codes
         item_data = []
         for item in items:
-            item_data.append({
-                "name": item.name,
-                "match_text": item.item_name.lower(),
-                "type": "name"
-            })
-            if item.item_code and item.item_code != item.item_name:
+            # Add item code as primary identifier
+            if item.item_code:
                 item_data.append({
-                    "name": item.name,
-                    "match_text": item.item_code.lower(),
+                    "item_name": item.item_code,  # Actual item code
+                    "match_text": re.sub(r'[\[\]]', '', item.item_code.lower()),
                     "type": "code"
                 })
+            
+            # Add item name as secondary identifier
+            if item.item_name and item.item_name.lower() != item.item_code.lower():
+                item_data.append({
+                    "item_name": item.item_code,  # Still use item code as identifier
+                    "match_text": re.sub(r'[\[\]]', '', item.item_name.lower()),
+                    "type": "name"
+                })
+        
         return item_data
     
     def extract_bracket_text(self, description):
@@ -399,23 +582,41 @@ class InvoiceUpload(Document):
         if not text:
             return None
             
-        clean_text = text.lower().strip()
+        # Clean text by removing special characters and brackets
+        clean_text = re.sub(r'[\[\]]', '', text).lower().strip()
         best_match = None
         best_score = 0
         
         for item in all_items:
-            score = difflib.SequenceMatcher(None, clean_text, item["match_text"]).ratio() * 100
+            # Clean match text similarly
+            clean_match = item["match_text"]
+            
+            # Calculate similarity score
+            score = difflib.SequenceMatcher(None, clean_text, clean_match).ratio() * 100
+            
+            # Give extra weight to code matches
+            if item["type"] == "code":
+                score = min(score * 1.2, 100)  # Boost code matches by 20%
+                
             if score > best_score:
                 best_score = score
                 best_match = {
-                    "name": item["name"],
+                    "item_name": item["item_name"],  # Actual item code
                     "score": score,
                     "match_type": item["type"],
                     "match_text": item["match_text"]
                 }
         
         # Return match only if it meets minimum confidence
-        return best_match if best_score > 70 else None
+        if best_score > 70:
+            return best_match
+            
+        # Try again with bracket extraction if first match failed
+        bracket_text = self.extract_bracket_text(text)
+        if bracket_text:
+            return self.fuzzy_match_item(bracket_text, all_items)
+            
+        return None
 
     def fuzzy_match_party(self, party_name):
         """Fuzzy match party against existing parties"""
@@ -459,6 +660,24 @@ def extract_invoice(docname):
         return result
     except Exception as e:
         frappe.log_error(f"Extract invoice failed: {str(e)}", "Extract Invoice Error")
+        return {"status": "error", "message": str(e)}
+
+
+@frappe.whitelist()
+def create_invoice(docname, submit_invoice=False):
+    """Create invoice from the Create Invoice button"""
+    try:
+        doc = frappe.get_doc("Invoice Upload", docname)
+        # Create draft invoice by default
+        doc.create_invoice_from_child(submit_invoice=submit_invoice)
+        return {
+            "status": "success",
+            "invoice_name": doc.invoice_reference,
+            "doctype": doc.invoice_type,
+            "status": doc.invoice_status
+        }
+    except Exception as e:
+        frappe.log_error(f"Create invoice failed: {str(e)}", "Create Invoice Error")
         return {"status": "error", "message": str(e)}
 
 
