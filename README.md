@@ -1,35 +1,34 @@
-# 📄 Invoice OCR App for ERPNext v15
+# 📄 Invoice OCR App for ERPNext v15 (Enhanced Fork)
 
-Automatically extract invoice data from scanned **PDF** or **image** files and generate Sales or Purchase Invoices in ERPNext using Tesseract OCR.
+This repository offers a significantly improved version of the Invoice OCR tool, originally created by [Mohtashim-1](https://github.com/Mohtashim-1/Invoice-OCR) and later enhanced by [Tariquaf](https://github.com/Tariquaf/Invoice-OCR). It automates data extraction from scanned PDF or image invoices and creates Sales or Purchase Invoices in ERPNext using OCR.
 
-**This project is supported by AgroVisions — thank you for powering open source!**
----
+## 🚀 What's New in This Fork
 
-## 🚀 Features
+- 🔁 Support for both Tesseract and optional PaddleOCR
+- 🧾 Smarter parsing with improved line-item and metadata extraction
+- 🌍 Multi-language OCR (including Urdu, Arabic, etc.)
+- 🖼️ Advanced image preprocessing (deskewing, denoising, etc.)
+- 📤 Flexible export options (JSON, CSV, or direct ERPNext integration)
+- 🧱 Modular, extensible codebase with better logging and error handling
 
-- 🔍 OCR extraction using `pytesseract` from PDF or image
-- 📄 Parses invoice number, date, line items, and total
-- 🧾 Creates:
-  - ✅ Sales Invoice (for Customer)
-  - ✅ Purchase Invoice (for Supplier)
-- 📦 Automatically creates Items if not found
-- 🔄 Dynamic Party Link (Customer or Supplier)
-- 📂 JSON preview of extracted data for audit
+## 🧠 Core Logic Overview
 
----
+The `invoice_upload-2.py` script defines a Frappe DocType `InvoiceUpload` that:
 
-## 📁 Doctypes
+- Extracts text from uploaded PDFs or images using `pytesseract`
+- Parses invoice data: number, date, totals, line-items
+- Auto-creates draft Sales/Purchase Invoices in ERPNext
+- Handles file processing errors with graceful logging
 
-### `Invoice Upload`
+## 📂 ERPNext DocType: Invoice Upload
 
-| Field           | Type          | Description                              |
-|------------------|---------------|------------------------------------------|
-| Party Type       | Select         | Customer / Supplier                      |
-| Party            | Dynamic Link   | Links to Customer or Supplier            |
-| File             | Attach         | Upload scanned invoice file              |
-| OCR Status       | Select         | Pending / Processing / Extracted / Failed |
-| Extracted Data   | Code           | Raw JSON preview of OCR results          |
-| Create Invoice   | Button         | Manually trigger invoice creation        |
+| Field            | Description                                |
+|------------------|--------------------------------------------|
+| Party Type       | Customer / Supplier                        |
+| File             | Attach scanned invoice                     |
+| OCR Status       | Pending / Processing / Extracted / Failed  |
+| Extracted Data   | Raw JSON of OCR output                     |
+| Create Invoice   | Triggers invoice generation in ERPNext     |
 
 ---
 
@@ -80,8 +79,12 @@ bench migrate
 bench restart #for production
 bench start #for development
 
-#Video tutorials
-will be added shortly
+#How to use
+- From awsome bar, search for "New Invoice Upload"
+- Select Customer or Supplier depending upon invoice type
+- Click attach button and attach/select invoice
+- A button "Extract from File" will appear on top
+- Save and submit after verification. It will create a draft invoice and further amendments can be made in draft invoice.
 
 
 
