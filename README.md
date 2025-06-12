@@ -79,7 +79,7 @@ bench migrate
 bench restart #for production
 bench start #for development
 
-#How to use
+### How to use
 - From awsome bar, search for "New Invoice Upload"
 - Select Customer or Supplier depending upon invoice type
 - Click attach button and attach/select invoice
