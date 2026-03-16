@@ -9,7 +9,6 @@ easyocr
 opencv-python
 cv2
 numpy as np
-frappe
 json
 re
 base64
